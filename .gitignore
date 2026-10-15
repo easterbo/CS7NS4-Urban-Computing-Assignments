@@ -1,7 +1,7 @@
-node_modules/
-.venv/
-node_modules/
 .venv/
 __pycache__/
 *.py[cod]
 .DS_Store
+.env
+firebase-service-account*.json
+data/Assignment2/.firebase-outbox/
