@@ -1,10 +1,11 @@
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 import firebase_admin
-from firebase_admin import credentials, storage
+from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
@@ -12,11 +13,12 @@ from flask import Flask, jsonify, request
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 server = Flask(__name__)
+server.logger.setLevel(logging.INFO) # DEBUG - TBR
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "Assignment2"
 PENDING_UPLOAD_DIR = DATA_DIR / ".firebase-outbox"
 FIREBASE_APP_NAME = "sensor-data-uploader"
-FIREBASE_STORAGE_PREFIX = "sensor-data"
+FIRESTORE_COLLECTION = "sensor-data"
 
 gps_data = []
 microphone_data = {}
@@ -30,27 +32,27 @@ pending_upload_seconds = {
 } if PENDING_UPLOAD_DIR.exists() else set()
 
 alignment_lock = Lock()
-firebase_bucket = None
+firestore_client = None
 
-def get_firebase_bucket():
-	global firebase_bucket
-	bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET")
-	if not bucket_name:
+def get_firestore_client():
+	global firestore_client
+	project_id = os.environ.get("FIREBASE_PROJECT_ID")
+	if not project_id:
 		raise RuntimeError(
-			"Firebase Storage is not configured. Set FIREBASE_STORAGE_BUCKET "
+			"Firebase Firestore is not configured. Set FIREBASE_PROJECT_ID "
 			"in .env or the server environment."
 		)
-	if firebase_bucket is None:
+	if firestore_client is None:
 		try:
 			firebase_app = firebase_admin.get_app(FIREBASE_APP_NAME)
 		except ValueError:
 			firebase_app = firebase_admin.initialize_app(
 				credentials.ApplicationDefault(),
-				{"storageBucket": bucket_name},
+				{"projectId": project_id},
 				name=FIREBASE_APP_NAME,
 			)
-		firebase_bucket = storage.bucket(bucket_name, app=firebase_app)
-	return firebase_bucket
+		firestore_client = firestore.client(app=firebase_app)
+	return firestore_client
 
 def format_timestamp(timestamp_ns):
 	timestamp_seconds = timestamp_ns // 1_000_000_000
@@ -82,14 +84,21 @@ def stage_interval(second):
 	pending_upload_seconds.add(second)
 
 
-def upload_interval(second, bucket):
+def upload_interval(second, client):
 	document_path = PENDING_UPLOAD_DIR / f"{second}.json"
-	blob = bucket.blob(f"{FIREBASE_STORAGE_PREFIX}/{second}.json")
-	blob.upload_from_string(
-		document_path.read_text(encoding="utf-8"),
-		content_type="application/json",
-	)
+	document = json.loads(document_path.read_text(encoding="utf-8"))
+	document_ref = client.collection(FIRESTORE_COLLECTION).document(str(second))
+	document_ref.set(document)
 	document_path.unlink()
+	# DEBUG - TBR
+	server.logger.info(
+		"Firestore write succeeded: project=%s collection=%s document=%s readings=%d",
+		client.project,
+		FIRESTORE_COLLECTION,
+		second,
+		len(document["readings"]),
+	)
+	# DEBUG - TBR
 
 
 @server.route("/data", methods=["POST"])
@@ -109,6 +118,11 @@ def receive_data():
 	payload = request_data["payload"]
 	with alignment_lock:
 		changed_seconds = set()
+		# DEBUG - TBR
+		microphone_readings_received = 0
+		moving_locations_received = 0
+		stationary_locations_received = 0
+		# DEBUG - TBR
 		for reading in payload:
 			name = reading.get("name")
 			values = reading.get("values", {})
@@ -121,12 +135,17 @@ def receive_data():
 					"volume": values.get("dBFS"),
 				}
 			elif name == "location" and timestamp:
-				if float(values.get("speed", 0) or 0) > 0:
+				speed = float(values.get("speed", 0) or 0)
+				if speed > 0:
 					gps_data.append({
 						"time": int(timestamp),
 						"latitude": values.get("latitude"),
 						"longitude": values.get("longitude"),
 					})
+				# DEBUG - TBR
+				else:
+					print(f"Skipping location reading with speed <= 0: {reading}")
+				# DEBUG - TBR
 
 		changed = False
 		for microphone_timestamp, microphone_row in microphone_data.items():
@@ -158,17 +177,37 @@ def receive_data():
 		for second in changed_seconds:
 			stage_interval(second)
 
+		# DEBUG - TBR
+		server.logger.info(
+			"Received batch: payload_readings=%d microphone=%d moving_locations=%d "
+			"speed_lt_zero_locations=%d, staged_intervals=%d "
+			"pending_intervals=%d",
+			len(payload),
+			microphone_readings_received,
+			moving_locations_received,
+			stationary_locations_received,
+			len(changed_seconds),
+			len(pending_upload_seconds),
+		)
+		# DEBUG - TBR
 		try:
-			bucket = get_firebase_bucket()
+			client = get_firestore_client()
 		except RuntimeError as error:
 			return jsonify({
 				"error": str(error),
 				"local_saved": changed,
 				"pending_intervals": len(pending_upload_seconds),
 			}), 503
+		# DEBUG - TBR
+		server.logger.info(
+			"Firestore destination: project=%s collection=%s",
+			client.project,
+			FIRESTORE_COLLECTION,
+		)
+		# DEBUG - TBR
 
 		for second in sorted(pending_upload_seconds):
-			upload_interval(second, bucket)
+			upload_interval(second, client)
 			pending_upload_seconds.remove(second)
 	return "success"
 
