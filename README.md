@@ -54,3 +54,32 @@ batch remains in the local outbox for retry.
 The Flask server uses the Firebase Admin SDK, so no browser Firebase
 configuration is required. Admin SDK access bypasses Firestore Security Rules;
 your Google account's IAM permissions control local server access.
+
+## LUAS stops
+The LUAS Forecasting API provides the current stop list. To fetch Red Line
+stops and sync them to Firestore, run this command from the project directory:
+
+```sh
+flask --app server sync-luas-stops
+```
+
+The command reads the LUAS XML stops feed and writes one document per Red Line
+stop to `luas-stops/<abbreviation>`. Each document contains only the `line`,
+`abbreviation`, `latitude`, and `longitude` fields. Re-running the command
+updates existing Red Line stops and adds new ones to the collection. It requires the same Firebase project
+configuration and Application Default Credentials as the sensor data receiver.
+
+When started with `python server.py`, the app polls the LUAS Forecasting
+API immediately and every 60 seconds for arrivals at each Red Line stop. The
+latest response for each stop is written to
+`luas-forecasts/<abbreviation>`; each document contains the line, stop
+abbreviation and name, API and poll timestamps, service message, and arrivals
+grouped by direction (due minutes and destination). A failed stop request is
+logged and does not prevent successful forecasts for other stops from being
+stored. The poller needs the same Firebase configuration and credentials.
+
+The [Luas Forecasting API dataset](https://data.gov.ie/dataset/luas-forecasting-api)
+documents the API and its stop abbreviations.
+
+`server.py` contains the Flask sensor-data receiver and app startup;
+`open_data.py` contains the LUAS feed parsing, Firestore writes, and forecast polling.

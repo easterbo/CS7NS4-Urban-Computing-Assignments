@@ -3,11 +3,20 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
+from urllib.error import HTTPError, URLError
+import xml.etree.ElementTree as ET
 import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from open_data import (
+	LUAS_FORECASTS_POLL_SECONDS,
+	LUAS_STOPS_COLLECTION,
+	fetch_luas_stops,
+	store_luas_stops,
+	run_luas_forecast_poller,
+)
 
 # Load local settings; deployments can provide environment variables directly.
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -32,6 +41,7 @@ pending_upload_seconds = {
 } if PENDING_UPLOAD_DIR.exists() else set()
 
 alignment_lock = Lock()
+forecast_poller_stop = Event()
 firestore_client = None
 
 def get_firestore_client():
@@ -39,8 +49,7 @@ def get_firestore_client():
 	project_id = os.environ.get("FIREBASE_PROJECT_ID")
 	if not project_id:
 		raise RuntimeError(
-			"Firebase Firestore is not configured. Set FIREBASE_PROJECT_ID "
-			"in .env or the server environment."
+			"Firebase Firestore is not configured. Set FIREBASE_PROJECT_ID in .env."
 		)
 	if firestore_client is None:
 		try:
@@ -53,6 +62,26 @@ def get_firestore_client():
 			)
 		firestore_client = firestore.client(app=firebase_app)
 	return firestore_client
+
+@server.cli.command("sync-luas-stops")
+def sync_luas_stops_cmd():
+	try:
+		stops = fetch_luas_stops()
+	except (HTTPError, URLError, TimeoutError, ET.ParseError, ValueError) as error:
+		server.logger.error("Unable to fetch LUAS stops: %s", error)
+		raise
+
+	client = get_firestore_client()
+	store_luas_stops(stops, client)
+
+	# DEBUG - TBR
+	server.logger.info(
+		"Stored %d Red Line LUAS stops in project=%s collection=%s",
+		len(stops),
+		client.project,
+		LUAS_STOPS_COLLECTION,
+	)
+	# DEBUG - TBR
 
 def format_timestamp(timestamp_ns):
 	timestamp_seconds = timestamp_ns // 1_000_000_000
@@ -213,4 +242,15 @@ def receive_data():
 
 
 if __name__ == "__main__":
+	Thread(
+		target=run_luas_forecast_poller,
+		args=(
+			get_firestore_client,
+			server.logger,
+			forecast_poller_stop,
+			LUAS_FORECASTS_POLL_SECONDS,
+		),
+		daemon=True,
+		name="luas-forecast-poller",
+	).start()
 	server.run(port=8000, host="0.0.0.0")
