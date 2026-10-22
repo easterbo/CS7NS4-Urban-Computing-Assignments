@@ -83,3 +83,17 @@ documents the API and its stop abbreviations.
 
 `server.py` contains the Flask sensor-data receiver and app startup;
 `open_data.py` contains the LUAS feed parsing, Firestore writes, and forecast polling.
+
+## Dublin map frontend
+The Vite frontend is in `frontend/`. It uses Leaflet with OpenStreetMap tiles
+to display an interactive map centered on Dublin. From that directory, install
+the JavaScript dependencies and start the development server:
+
+```sh
+cd frontend
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite. The frontend is currently a standalone map;
+it does not yet load sensor readings or LUAS data from Flask.

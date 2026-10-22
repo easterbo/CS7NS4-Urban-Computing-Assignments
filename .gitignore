@@ -5,3 +5,5 @@ __pycache__/
 .env
 firebase-service-account*.json
 data/Assignment2/.firebase-outbox/
+node_modules/
+dist/

@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from open_data import (
+from backend.open_data import (
 	LUAS_FORECASTS_POLL_SECONDS,
 	LUAS_STOPS_COLLECTION,
 	fetch_luas_stops,
@@ -19,7 +19,7 @@ from open_data import (
 )
 
 # Load local settings; deployments can provide environment variables directly.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 server = Flask(__name__)
 server.logger.setLevel(logging.INFO) # DEBUG - TBR
@@ -241,16 +241,27 @@ def receive_data():
 	return "success"
 
 
+@server.get("/api/luas/stops")
+def get_luas_stops():
+	try:
+		documents = get_firestore_client().collection(LUAS_STOPS_COLLECTION).stream()
+	except RuntimeError as error:
+		return jsonify({"error": str(error)}), 503
+
+	stops = [document.to_dict() for document in documents]
+	return jsonify(stops)
+
+
 if __name__ == "__main__":
-	Thread(
-		target=run_luas_forecast_poller,
-		args=(
-			get_firestore_client,
-			server.logger,
-			forecast_poller_stop,
-			LUAS_FORECASTS_POLL_SECONDS,
-		),
-		daemon=True,
-		name="luas-forecast-poller",
-	).start()
+	# Thread(
+	# 	target=run_luas_forecast_poller,
+	# 	args=(
+	# 		get_firestore_client,
+	# 		server.logger,
+	# 		forecast_poller_stop,
+	# 		LUAS_FORECASTS_POLL_SECONDS,
+	# 	),
+	# 	daemon=True,
+	# 	name="luas-forecast-poller",
+	# ).start()
 	server.run(port=8000, host="0.0.0.0")
