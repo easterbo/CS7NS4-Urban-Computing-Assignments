@@ -1,27 +1,39 @@
+import json
 import logging
+import ssl
 from datetime import datetime, timezone
 from time import monotonic
 from threading import Event
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+import certifi
 import xml.etree.ElementTree as ET
 
 LUAS_STOPS_COLLECTION = "luas-stops"
+LUAS_LINE_COLLECTION = "luas-line"
 LUAS_RED_LINE = "Luas Red Line"
+LUAS_RED_LINE_GEOJSON_URL = (
+	"https://raw.githubusercontent.com/BuildingCityDashboards/"
+	"bcd-dd-v2.1/master/public/data/Transport/LUAS_Red_Line.geojson"
+)
 LUAS_FORECASTS_COLLECTION = "luas-forecasts"
 LUAS_FORECASTS_POLL_SECONDS = 60
 LUAS_STOPS_API_URL = (
 	"https://luasforecasts.rpa.ie/xml/get.ashx?action=stops&encrypt=false"
 )
 
-def fetch_luas_stops():
-	api_request = Request(
-		LUAS_STOPS_API_URL,
-		headers={"User-Agent": "UrbanComputingAssignments/1.0"},
+def _open_url(api_request):
+	return urlopen(
+		api_request,
+		timeout=20,
+		context=ssl.create_default_context(cafile=certifi.where()),
 	)
 
-	with urlopen(api_request, timeout=20) as response:
+def fetch_luas_stops():
+	api_request = Request(LUAS_STOPS_API_URL, headers={"User-Agent": "UrbanComputingAssignments/1.0"},)
+
+	with _open_url(api_request) as response:
 		xml_data = response.read()
 	root = ET.fromstring(xml_data)
 	if root.tag != "stops":
@@ -30,26 +42,24 @@ def fetch_luas_stops():
 	stops = []
 	for line in root.findall("line"):
 		line_name = line.get("name")
-		if not line_name:
-			raise ValueError("LUAS API response contains a line without a name.")
+		if not line_name: raise ValueError("LUAS API response contains a line without a name.")
 
 		if line_name != LUAS_RED_LINE:
 			continue
 		for stop in line.findall("stop"):
 			abbreviation = stop.get("abrev")
-			if not abbreviation:
-				raise ValueError("LUAS API response contains a stop without an ID.")
+			if not abbreviation: raise ValueError("LUAS API response contains a stop without an ID.")
 			try:
 				latitude = float(stop.attrib["lat"])
 				longitude = float(stop.attrib["long"])
 			except (KeyError, ValueError) as error:
-				raise ValueError(
-					f"LUAS stop {abbreviation} has invalid coordinates."
-				) from error
+				raise ValueError(f"LUAS stop {abbreviation} has invalid coordinates.") from error
 
 			stops.append({
 				"abbreviation": abbreviation,
 				"line": line_name,
+				"stop_name": stop.text or abbreviation,
+				"sequence": len(stops),
 				"latitude": latitude,
 				"longitude": longitude,
 			})
@@ -58,29 +68,49 @@ def fetch_luas_stops():
 		raise ValueError("LUAS API response did not contain any stops.")
 	return stops
 
+def fetch_luas_line():
+	api_request = Request(LUAS_RED_LINE_GEOJSON_URL, headers={"User-Agent": "UrbanComputingAssignments/1.0"})
+
+	with _open_url(api_request) as response:
+		try: geojson = json.loads(response.read())
+		except json.JSONDecodeError as error: raise ValueError("LUAS Red Line endpoint did not return valid JSON.") from error
+
+	if (
+		not isinstance(geojson, dict)
+		or geojson.get("type") != "FeatureCollection"
+		or not isinstance(geojson.get("features"), list)
+		or not geojson["features"]
+	):
+		raise ValueError("LUAS Red Line endpoint did not return a non-empty GeoJSON FeatureCollection.")
+
+	for feature in geojson["features"]:
+		if (
+			not isinstance(feature, dict)
+			or feature.get("type") != "Feature"
+			or not isinstance(feature.get("properties"), dict)
+			or feature["properties"].get("name") != LUAS_RED_LINE
+			or not isinstance(feature.get("geometry"), dict)
+			or feature["geometry"].get("type") not in ("LineString", "MultiLineString")
+		):
+			raise ValueError("LUAS Red Line endpoint contains an invalid or non-Red-Line feature.")
+	return geojson
+
 def fetch_luas_forecast(stop):
 	query = urlencode({
 		"action": "forecast",
 		"stop": stop["abbreviation"].lower(),
 		"encrypt": "false",
 	})
-	api_request = Request(
-		f"https://luasforecasts.rpa.ie/xml/get.ashx?{query}",
-		headers={"User-Agent": "UrbanComputingAssignments/1.0"},
-	)
-	with urlopen(api_request, timeout=20) as response:
+	api_request = Request(f"https://luasforecasts.rpa.ie/xml/get.ashx?{query}", headers={"User-Agent": "UrbanComputingAssignments/1.0"})
+	with _open_url(api_request) as response:
 		xml_data = response.read()
 
 	root = ET.fromstring(xml_data)
 	if root.tag != "stopInfo":
-		raise ValueError(
-			f"LUAS forecast for {stop['abbreviation']} did not contain stopInfo."
-		)
+		raise ValueError(f"LUAS forecast for {stop['abbreviation']} did not contain stopInfo.")
 	response_abbreviation = root.get("stopAbv", "").upper()
 	if response_abbreviation != stop["abbreviation"]:
-		raise ValueError(
-			f"LUAS forecast stop ID mismatch for {stop['abbreviation']}."
-		)
+		raise ValueError(f"LUAS forecast stop ID mismatch for {stop['abbreviation']}.")
 
 	directions = []
 	for direction in root.findall("direction"):
@@ -91,14 +121,8 @@ def fetch_luas_forecast(stop):
 				due_minutes = int(due_minutes)
 			else:
 				due_minutes = None
-			trams.append({
-				"due_minutes": due_minutes,
-				"destination": tram.get("destination", ""),
-			})
-		directions.append({
-			"name": direction.get("name", ""),
-			"trams": trams,
-		})
+			trams.append({"due_minutes": due_minutes, "destination": tram.get("destination", "")})
+		directions.append({"name": direction.get("name", ""), "trams": trams})
 
 	return {
 		"line": stop["line"],
@@ -117,32 +141,21 @@ def sync_luas_forecasts(client, logger):
 		try:
 			forecasts.append(fetch_luas_forecast(stop))
 		except (HTTPError, URLError, TimeoutError, ET.ParseError, ValueError) as error:
-			logger.warning(
-				"Unable to fetch LUAS forecast for %s: %s",
-				stop["abbreviation"],
-				error,
-			)
+			logger.warning("Unable to fetch LUAS forecast for %s: %s", stop["abbreviation"], error)
 
 	if forecasts:
 		batch = client.batch()
 		collection = client.collection(LUAS_FORECASTS_COLLECTION)
 		for forecast in forecasts:
-			batch.set(
-				collection.document(forecast["abbreviation"]),
-				forecast,
-			)
+			batch.set(collection.document(forecast["abbreviation"]), forecast)
 		batch.commit()
-
 	return len(forecasts), len(stops) - len(forecasts)
 
 def run_luas_forecast_poller(client_factory, logger, stop_event, interval):
 	while not stop_event.is_set():
 		poll_started_at = datetime.now(timezone.utc)
 		started_at = monotonic()
-		logger.info(
-			"Starting LUAS forecast poll at %s",
-			poll_started_at.isoformat(),
-		)
+		logger.info("Starting LUAS forecast poll at %s", poll_started_at.isoformat())
 		try:
 			client = client_factory()
 			uploaded, failed = sync_luas_forecasts(client, logger)
@@ -169,3 +182,8 @@ def store_luas_stops(stops, client):
 		for stop in stops[offset:offset + 500]:
 			batch.set(collection.document(stop["abbreviation"]), stop)
 		batch.commit()
+
+def store_luas_line(geojson, client):
+	client.collection(LUAS_LINE_COLLECTION).document("red-line").set({
+		"geojson": json.dumps(geojson, separators=(",", ":")),
+	})

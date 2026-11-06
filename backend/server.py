@@ -1,19 +1,26 @@
+import csv
 import json
 import logging
 import os
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from urllib.error import HTTPError, URLError
 import xml.etree.ElementTree as ET
 import firebase_admin
+import click
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from backend.open_data import (
 	LUAS_FORECASTS_POLL_SECONDS,
+	LUAS_FORECASTS_COLLECTION,
+	LUAS_LINE_COLLECTION,
 	LUAS_STOPS_COLLECTION,
+	fetch_luas_line,
 	fetch_luas_stops,
+	store_luas_line,
 	store_luas_stops,
 	run_luas_forecast_poller,
 )
@@ -63,25 +70,98 @@ def get_firestore_client():
 		firestore_client = firestore.client(app=firebase_app)
 	return firestore_client
 
+@server.cli.command("upload-dataset")
+@click.argument(
+	"csv_path",
+	type=click.Path(exists=True, dir_okay=False, path_type=Path),
+	required=False,
+)
+def upload_dataset_cmd(csv_path=None):
+	if csv_path is None:
+		csv_path = Path(__file__).resolve().parent / "data" / "Assignment1" / "Dataset.csv"
+
+	readings_by_second = defaultdict(list)
+	expected_fields = {"time", "volume", "latitude", "longitude"}
+	try:
+		with csv_path.open(newline="", encoding="utf-8-sig") as source:
+			reader = csv.DictReader(source)
+			if not expected_fields.issubset(reader.fieldnames or []):
+				raise click.ClickException(
+					"CSV must contain time, volume, latitude, and longitude columns."
+				)
+
+			for line_number, row in enumerate(reader, start=2):
+				try:
+					timestamp = datetime.strptime(
+						row["time"], "%d:%m:%Y %H:%M:%S"
+					).replace(tzinfo=timezone.utc)
+					second = int(timestamp.timestamp())
+					reading = {
+						"time": timestamp.strftime("%d:%m:%Y %H:%M:%S"),
+						"volume": float(row["volume"]),
+						"latitude": float(row["latitude"]),
+						"longitude": float(row["longitude"]),
+					}
+				except (TypeError, ValueError) as error:
+					raise click.ClickException(
+						f"Invalid sensor reading on CSV line {line_number}."
+					) from error
+				readings_by_second[second].append(reading)
+	except (OSError, csv.Error) as error:
+		raise click.ClickException(f"Unable to read {csv_path}: {error}") from error
+
+	if not readings_by_second:
+		raise click.ClickException(f"No sensor readings found in {csv_path}.")
+
+	client = get_firestore_client()
+	collection = client.collection(FIRESTORE_COLLECTION)
+	seconds = sorted(readings_by_second)
+	for offset in range(0, len(seconds), 500):
+		batch = client.batch()
+		for second in seconds[offset:offset + 500]:
+			readings = sorted(
+				readings_by_second[second],
+				key=lambda reading: reading["time"],
+			)
+			batch.set(
+				collection.document(str(second)),
+				{
+					"interval_start": format_timestamp(second * 1_000_000_000),
+					"readings": readings,
+				},
+			)
+		batch.commit()
+
+	click.echo(
+		f"Uploaded {sum(map(len, readings_by_second.values()))} readings "
+		f"in {len(seconds)} documents to {client.project}/{FIRESTORE_COLLECTION}."
+	)
+
 @server.cli.command("sync-luas-stops")
 def sync_luas_stops_cmd():
 	try:
 		stops = fetch_luas_stops()
+		red_line = fetch_luas_line()
 	except (HTTPError, URLError, TimeoutError, ET.ParseError, ValueError) as error:
-		server.logger.error("Unable to fetch LUAS stops: %s", error)
+		server.logger.error("Unable to fetch LUAS stops or Red Line geometry: %s", error)
 		raise
 
 	client = get_firestore_client()
 	store_luas_stops(stops, client)
+	store_luas_line(red_line, client)
 
-	# DEBUG - TBR
 	server.logger.info(
 		"Stored %d Red Line LUAS stops in project=%s collection=%s",
 		len(stops),
 		client.project,
 		LUAS_STOPS_COLLECTION,
 	)
-	# DEBUG - TBR
+	server.logger.info(
+		"Stored Red Line GeoJSON with %d features in project=%s collection=%s document=red-line",
+		len(red_line["features"]),
+		client.project,
+		LUAS_LINE_COLLECTION,
+	)
 
 def format_timestamp(timestamp_ns):
 	timestamp_seconds = timestamp_ns // 1_000_000_000
@@ -249,19 +329,77 @@ def get_luas_stops():
 		return jsonify({"error": str(error)}), 503
 
 	stops = [document.to_dict() for document in documents]
+	stops.sort(key=lambda stop: stop.get("sequence", float("inf")))
 	return jsonify(stops)
 
 
+@server.get("/api/luas/forecasts")
+def get_luas_forecasts():
+	try:
+		documents = get_firestore_client().collection(LUAS_FORECASTS_COLLECTION).stream()
+	except RuntimeError as error:
+		return jsonify({"error": str(error)}), 503
+
+	return jsonify([document.to_dict() for document in documents])
+
+
+@server.get("/api/luas/line")
+def get_luas_line():
+	try:
+		document = (
+			get_firestore_client()
+			.collection(LUAS_LINE_COLLECTION)
+			.document("red-line")
+			.get()
+		)
+	except RuntimeError as error:
+		return jsonify({"error": str(error)}), 503
+
+	if not document.exists:
+		return jsonify({"error": "LUAS Red Line geometry has not been synced."}), 404
+
+	stored_line = document.to_dict()
+	try:
+		geojson = json.loads(stored_line["geojson"])
+	except (KeyError, TypeError, json.JSONDecodeError) as error:
+		server.logger.exception("Stored LUAS Red Line geometry is invalid")
+		return jsonify({"error": "Stored LUAS Red Line geometry is invalid."}), 500
+
+	return jsonify(geojson)
+
+@server.get("/api/sensor-data")
+def get_sensor_data():
+	try:
+		documents = get_firestore_client().collection(FIRESTORE_COLLECTION).stream()
+	except RuntimeError as error:
+		return jsonify({"error": str(error)}), 503
+
+	readings = []
+	for document in documents:
+		batch = document.to_dict()
+		if not isinstance(batch, dict) or not isinstance(batch.get("readings"), list):
+			server.logger.error(
+				"Invalid sensor-data document %s: expected a readings array",
+				document.id,
+			)
+			return jsonify({
+				"error": f"Sensor-data document {document.id} has an invalid readings array."
+			}), 500
+		readings.extend(batch["readings"])
+
+	return jsonify(readings)
+
+
 if __name__ == "__main__":
-	# Thread(
-	# 	target=run_luas_forecast_poller,
-	# 	args=(
-	# 		get_firestore_client,
-	# 		server.logger,
-	# 		forecast_poller_stop,
-	# 		LUAS_FORECASTS_POLL_SECONDS,
-	# 	),
-	# 	daemon=True,
-	# 	name="luas-forecast-poller",
-	# ).start()
+	Thread(
+		target=run_luas_forecast_poller,
+		args=(
+			get_firestore_client,
+			server.logger,
+			forecast_poller_stop,
+			LUAS_FORECASTS_POLL_SECONDS,
+		),
+		daemon=True,
+		name="luas-forecast-poller",
+	).start()
 	server.run(port=8000, host="0.0.0.0")

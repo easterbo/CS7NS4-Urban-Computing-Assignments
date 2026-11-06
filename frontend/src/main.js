@@ -1,6 +1,10 @@
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import './style.css';
+import { loadLuasRoute } from './route.js';
+import { loadLuasStops } from './stops.js';
+import { addVolumeLegend, loadSensorReadings } from './sensors.js';
+import { loadLuasTrams } from './trams.js';
 
 const map = L.map('map', {
   maxBoundsViscosity: 1.0,
@@ -8,7 +12,6 @@ const map = L.map('map', {
   scrollWheelZoom: true,
 });
 
-// Add OpenStreetMap tiles to the map.
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution:
@@ -17,44 +20,36 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-// Call the Red Line stop locations from the backend and use their bounds as the
-// basis for initial map size and zoom limits.
-const stopLayer = L.layerGroup().addTo(map);
+async function loadMapData() {
+  const [routeResult, stopsResult] = await Promise.allSettled([
+    loadLuasRoute(map),
+    loadLuasStops(map),
+  ]);
+  const bounds = L.latLngBounds([]);
 
-async function loadLuasStops() {
-  const response = await fetch('/api/luas/stops');
-  if (!response.ok) {
-    throw new Error(`Could not load LUAS stops (${response.status})`);
+  for (const [index, result] of [routeResult, stopsResult].entries()) {
+    if (result.status === 'fulfilled') { bounds.extend(result.value); }
+    else if (result.status === 'rejected') {
+      const dataName = ['LUAS Red Line route', 'LUAS stops'][index];
+      console.error(`Unable to display ${dataName}:`, result.reason);
+    }
   }
 
-  const stops = await response.json();
-  const stopBounds = L.latLngBounds([]);
+  if (!bounds.isValid()) { throw new Error('No LUAS route or stop locations could be displayed'); }
 
-  for (const stop of stops) {
-    const latitude = Number(stop.latitude);
-    const longitude = Number(stop.longitude);
-
-    const location = [latitude, longitude];
-    stopBounds.extend(location);
-
-    const marker = L.circleMarker(location, {
-      radius: 5,
-      color: '#fffdf8',
-      weight: 2,
-      fillColor: '#e76f51',
-      fillOpacity: 1,
-    }).addTo(stopLayer);
-
-    const popup = document.createElement('strong');
-    popup.textContent = `${stop.stop_name ?? stop.abbreviation} — ${stop.line}`;
-    marker.bindPopup(popup);
-  }
-
-  map.fitBounds(stopBounds, { padding: [30, 30], animate: false });
+  map.fitBounds(bounds, { padding: [30, 30], animate: false });
   map.setMaxBounds(map.getBounds());
   map.setMinZoom(map.getZoom());
+
+  await loadLuasTrams(map);
+
+  if (routeResult.status === 'fulfilled') {
+    try { addVolumeLegend(map, await loadSensorReadings(map)); }
+    catch (error) {
+      console.error('Unable to display sensor readings:', error);
+      addVolumeLegend(map, 0, error);
+    }
+  }
 }
 
-loadLuasStops().catch((error) => {
-  console.error('Unable to display LUAS stops:', error);
-});
+loadMapData().catch((error) => { console.error('Unable to initialize the LUAS map:', error); });
